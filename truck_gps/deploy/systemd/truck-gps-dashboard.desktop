@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Truck GPS Dashboard Kiosk
+Comment=Launch dashboard in fullscreen kiosk mode
+Exec=@HOME@/truck_gps/deploy/systemd/start-dashboard-kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,354 +1,390 @@
 #!/usr/bin/env python3
 """
-서버로 GPS + 온도 데이터를 전송하는 클래스
-MySQL 데이터베이스 또는 HTTP API를 통한 데이터 전송
+Send GPS + temperature rows to the configured MQTT broker.
 """
 
-import requests
 import json
-import time
 import logging
+import os
+import subprocess
 import threading
-from datetime import datetime, timedelta
-from config import (SERVER_HOST, SERVER_PORT, SERVER_DATABASE, SERVER_USERNAME, SERVER_PASSWORD,
-                   SERVER_API_URL, SERVER_API_KEY, VEHICLE_ID, SEND_INTERVAL, BATCH_SIZE,
-                   RETRY_ATTEMPTS, RETRY_DELAY)
+import time
+from datetime import datetime
+
+from config import (
+    BATCH_SIZE,
+    MQTT_BROKER_HOST,
+    MQTT_BROKER_PORT,
+    MQTT_CA_CERT,
+    MQTT_CLIENT_ID,
+    MQTT_DEVICE_CERT,
+    MQTT_PRIVATE_KEY,
+    MQTT_QOS,
+    MQTT_RETAIN,
+    MQTT_TOPIC,
+    MQTT_USE_TLS,
+    SEND_INTERVAL,
+    TEMP_RANGES,
+    VEHICLE_ID,
+)
+from database import GPSDatabase
+from log_utils import log_repeat
 
 logger = logging.getLogger(__name__)
 
 
 class ServerSender:
-    """서버로 데이터를 전송하는 클래스"""
+    """Background sender that publishes unsent rows to MQTT."""
 
     def __init__(self, db_path):
-        self.db_path = db_path  # 데이터베이스 경로만 저장
+        self.db_path = db_path
         self.vehicle_id = VEHICLE_ID
         self.send_interval = SEND_INTERVAL
         self.batch_size = BATCH_SIZE
-        self.retry_attempts = RETRY_ATTEMPTS
-        self.retry_delay = RETRY_DELAY
 
+        self.mqtt_broker_host = MQTT_BROKER_HOST
+        self.mqtt_broker_port = MQTT_BROKER_PORT
+        self.mqtt_topic = MQTT_TOPIC
+        self.mqtt_client_id = MQTT_CLIENT_ID
+        self.mqtt_qos = MQTT_QOS
+        self.mqtt_retain = MQTT_RETAIN
+        self.mqtt_use_tls = MQTT_USE_TLS
+        self.mqtt_ca_cert = MQTT_CA_CERT
+        self.mqtt_device_cert = MQTT_DEVICE_CERT
+        self.mqtt_private_key = MQTT_PRIVATE_KEY
+
+        self.mqtt_client = None
+        self._mqtt_connected_event = threading.Event()
+
+        self.db = None
         self.running = False
         self.last_send_time = None
         self.send_thread = None
 
-        # 전송 통계
         self.stats = {
-            'total_sent': 0,
-            'send_failures': 0,
-            'last_success': None
+            "total_sent": 0,
+            "send_failures": 0,
+            "last_success": None,
         }
-
-        # 온도 상태 범위 설정
-        self.temp_ranges = {
-            'critical_cold': (-float('inf'), 2.0),
-            'cold': (2.0, 2.5),
-            'normal': (2.5, 7.5),
-            'warm': (7.5, 8.0),
-            'critical_hot': (8.0, float('inf'))
-        }
+        self.temp_ranges = TEMP_RANGES
 
     def start(self):
-        """서버 전송 시작"""
+        """Start the background sender thread."""
         if self.running:
-            logger.warning("서버 전송이 이미 실행 중입니다")
+            logger.warning("Server sender is already running")
             return
 
         self.running = True
         self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self.send_thread.start()
-        logger.info(f"서버 전송 시작 (인터벌: {self.send_interval}초)")
+
+        mode = "TLS" if self.mqtt_use_tls else "plain"
+        logger.debug(
+            f"서버 전송 시작 (인터벌: {self.send_interval}초, "
+            f"MQTT [{mode}]: {self.mqtt_broker_host}:{self.mqtt_broker_port}, "
+            f"토픽: {self.mqtt_topic})"
+        )
 
     def stop(self):
-        """서버 전송 중지"""
+        """Stop the background sender thread."""
         if not self.running:
             return
 
         self.running = False
         if self.send_thread:
             self.send_thread.join(timeout=5)
-        logger.info("서버 전송 중지")
+        logger.info("Server sender stopped")
 
     def _send_loop(self):
-        """전송 루프 (백그라운드 스레드)"""
-        while self.running:
+        """Run the send loop with one DB connection owned by this thread."""
+        try:
+            self._ensure_db_connected()
+
+            while self.running:
+                try:
+                    current_time = time.time()
+                    if (
+                        self.last_send_time is None
+                        or current_time - self.last_send_time >= self.send_interval
+                    ):
+                        self._send_batch()
+                        self.last_send_time = current_time
+
+                    remaining = self.send_interval - (time.time() - (self.last_send_time or 0))
+                    sleep_for = max(0.01, min(0.2, remaining))
+                    time.sleep(sleep_for)
+
+                except Exception as e:
+                    log_repeat(logger, "sender.loop", logging.ERROR, "Send loop error: %s", e)
+                    time.sleep(1)
+        finally:
+            self._close_db()
+
+    def _ensure_db_connected(self):
+        """Keep one SQLite connection for the sender thread."""
+        if self.db is None:
+            self.db = GPSDatabase(self.db_path)
+            self.db.connect()
+
+    def _close_db(self):
+        """Close the sender thread's SQLite connection."""
+        if self.db:
             try:
-                current_time = time.time()
-
-                # 전송 간격 확인
-                if (self.last_send_time is None or
-                    current_time - self.last_send_time >= self.send_interval):
-
-                    self._send_batch()
-                    self.last_send_time = current_time
-
-                time.sleep(10)  # 10초마다 체크
-
-            except Exception as e:
-                logger.error(f"전송 루프 오류: {e}")
-                time.sleep(30)  # 오류 발생 시 30초 대기
+                self.db.close()
+            finally:
+                self.db = None
 
     def _send_batch(self):
-        """배치 데이터 전송"""
+        """Send one batch of unsent rows."""
         try:
-            # 전송할 데이터 조회
             data_to_send = self._get_unsent_data()
             if not data_to_send:
-                logger.debug("전송할 새 데이터가 없습니다")
+                logger.debug("No data to send")
                 return
 
-            logger.info(f"{len(data_to_send)}개의 데이터를 서버로 전송합니다")
-
-            # 서버로 전송 (두 가지 방법 모두 시도)
-            success = self._send_to_mysql(data_to_send) or self._send_to_api(data_to_send)
+            logger.debug(f"Sending {len(data_to_send)} rows via MQTT")
+            success = self._send_to_mqtt(data_to_send)
 
             if success:
-                # 성공 시 전송 완료 표시
-                self._mark_data_as_sent([item['id'] for item in data_to_send])
-                self.stats['total_sent'] += len(data_to_send)
-                self.stats['last_success'] = datetime.now()
-                logger.info(f"✅ {len(data_to_send)}개 데이터 전송 성공")
+                self.stats["total_sent"] += len(data_to_send)
+                self.stats["last_success"] = datetime.now()
+                logger.debug(f"Sent {len(data_to_send)} rows")
             else:
-                self.stats['send_failures'] += 1
-                logger.error("❌ 데이터 전송 실패")
+                self.stats["send_failures"] += 1
+                log_repeat(logger, "sender.send_failed", logging.ERROR, "Data send failed")
 
         except Exception as e:
-            logger.error(f"배치 전송 오류: {e}")
-            self.stats['send_failures'] += 1
+            log_repeat(logger, "sender.batch", logging.ERROR, "Batch send error: %s", e)
+            self.stats["send_failures"] += 1
+
+    def _verify_tls_cert_files(self):
+        missing = [
+            path
+            for path in (self.mqtt_ca_cert, self.mqtt_device_cert, self.mqtt_private_key)
+            if not os.path.isfile(path)
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "TLS certificate files are missing. Run python3 provision_iot_cert.py on the Pi: "
+                + ", ".join(missing)
+            )
+
+    def _init_mqtt_client(self):
+        """Initialize the MQTT client."""
+        try:
+            import paho.mqtt.client as mqtt
+
+            self._reset_mqtt_client()
+            self.mqtt_client = mqtt.Client(client_id=self.mqtt_client_id, clean_session=True)
+
+            def on_connect(client, userdata, flags, rc):
+                if rc == 0:
+                    logger.debug(
+                        f"MQTT broker connected: {self.mqtt_broker_host}:{self.mqtt_broker_port}"
+                    )
+                    self._mqtt_connected_event.set()
+                else:
+                    log_repeat(
+                        logger,
+                        "sender.mqtt_connect",
+                        logging.ERROR,
+                        "MQTT broker connection failed: %s",
+                        rc,
+                    )
+
+            def on_disconnect(client, userdata, rc):
+                if rc != 0:
+                    log_repeat(
+                        logger,
+                        "sender.mqtt_disconnect",
+                        logging.WARNING,
+                        "MQTT broker disconnected: %s",
+                        rc,
+                    )
+                self._mqtt_connected_event.clear()
+
+            self.mqtt_client.on_connect = on_connect
+            self.mqtt_client.on_disconnect = on_disconnect
+
+            if self.mqtt_use_tls:
+                self._verify_tls_cert_files()
+                self.mqtt_client.tls_set(
+                    ca_certs=self.mqtt_ca_cert,
+                    certfile=self.mqtt_device_cert,
+                    keyfile=self.mqtt_private_key,
+                )
+
+            self._mqtt_connected_event.clear()
+            self.mqtt_client.connect(self.mqtt_broker_host, self.mqtt_broker_port, 60)
+            self.mqtt_client.loop_start()
+            self._mqtt_connected_event.wait(timeout=5)
+
+        except Exception as e:
+            log_repeat(logger, "sender.mqtt_init", logging.ERROR, "MQTT client init failed: %s", e)
+            self._reset_mqtt_client()
+
+    def _reset_mqtt_client(self):
+        """Stop and discard the current MQTT client so the next send can reconnect."""
+        self._mqtt_connected_event.clear()
+        if self.mqtt_client is None:
+            return
+
+        try:
+            self.mqtt_client.loop_stop()
+        except Exception:
+            pass
+
+        try:
+            self.mqtt_client.disconnect()
+        except Exception:
+            pass
+
+        self.mqtt_client = None
+
+    def _ensure_mqtt_connected(self):
+        """Ensure there is an active MQTT connection before publishing."""
+        if self.mqtt_client is None:
+            self._init_mqtt_client()
+        elif not self._mqtt_connected_event.is_set():
+            log_repeat(
+                logger,
+                "sender.mqtt_reinit",
+                logging.WARNING,
+                "MQTT is disconnected; reinitializing client",
+            )
+            self._init_mqtt_client()
+
+        return self._mqtt_connected_event.wait(timeout=5)
+
+    def _send_to_mqtt(self, data):
+        """Publish data to MQTT."""
+        try:
+            if not self._ensure_mqtt_connected() or self.mqtt_client is None:
+                return False
+
+            for payload in data:
+                json_payload = json.dumps(payload, default=str)
+                result = self.mqtt_client.publish(
+                    self.mqtt_topic,
+                    json_payload,
+                    qos=self.mqtt_qos,
+                    retain=self.mqtt_retain,
+                )
+
+                if result.rc != 0:
+                    log_repeat(
+                        logger,
+                        "sender.mqtt_publish",
+                        logging.ERROR,
+                        "MQTT publish failed: %s",
+                        result.rc,
+                    )
+                    self._reset_mqtt_client()
+                    return self._send_to_mqtt_with_mosquitto(json_payload, 1)
+
+            logger.debug(f"Published {len(data)} rows to MQTT")
+            return True
+
+        except Exception as e:
+            log_repeat(logger, "sender.mqtt_send", logging.ERROR, "MQTT send failed: %s", e)
+            self._reset_mqtt_client()
+            return False
+
+    def _send_to_mqtt_with_mosquitto(self, json_payload, row_count):
+        """Fallback publisher using mosquitto_pub."""
+        try:
+            cmd = [
+                "mosquitto_pub",
+                "-h",
+                self.mqtt_broker_host,
+                "-p",
+                str(self.mqtt_broker_port),
+                "-t",
+                self.mqtt_topic,
+                "-m",
+                json_payload,
+                "-q",
+                str(self.mqtt_qos),
+            ]
+            if self.mqtt_use_tls:
+                cmd.extend(
+                    [
+                        "--cafile",
+                        self.mqtt_ca_cert,
+                        "--cert",
+                        self.mqtt_device_cert,
+                        "--key",
+                        self.mqtt_private_key,
+                    ]
+                )
+
+            subprocess.run(cmd, check=True)
+            logger.debug(f"Published {row_count} rows with mosquitto_pub fallback")
+            return True
+        except Exception as e:
+            log_repeat(
+                logger, "sender.mosquitto", logging.ERROR, "mosquitto_pub fallback failed: %s", e
+            )
+            return False
 
     def _get_unsent_data(self):
-        """전송하지 않은 GPS+온도 데이터 조회 (중복 전송 방지)"""
+        """Load unsent rows using the sender thread's persistent DB connection."""
         try:
-            # 각 스레드에서 독립적인 데이터베이스 연결 생성
-            import sqlite3
-            from database import GPSDatabase
-
-            db = GPSDatabase(self.db_path)
-            db.connect()
-
-            # 전송하지 않은 GPS+온도 데이터만 조회
-            unsent_data = db.get_unsent_gps_temperature_data(limit=self.batch_size)
-
-            # 데이터를 서버 전송 형식으로 변환
-            formatted_data = []
-            for row in unsent_data:
-                formatted_data.append(self._format_gps_temperature_data_for_server(row))
-
-            db.close()
-            return formatted_data
-
+            self._ensure_db_connected()
+            unsent_data = self.db.get_unsent_gps_temperature_data(limit=self.batch_size)
+            return [self._format_gps_temperature_data_for_server(row) for row in unsent_data]
         except Exception as e:
-            logger.error(f"GPS+온도 데이터 조회 오류: {e}")
+            log_repeat(
+                logger, "sender.query", logging.ERROR, "GPS+temperature data query error: %s", e
+            )
             return []
 
     def _format_gps_temperature_data_for_server(self, row):
-        """GPS+온도 데이터베이스 행을 서버 형식으로 변환"""
-        # row: (id, vehicle_id, timestamp, datetime, latitude, longitude, altitude, speed, heading, temperature, status, sent, sent_at, created_at)
-
-        # 온도 상태 재확인 (데이터베이스에 저장된 상태 우선 사용)
-        temperature = row[9]   # temperature 필드 (인덱스 9)
-        db_status = row[10]    # status 필드 (인덱스 10)
-
-        # 데이터베이스에 상태가 없거나 unknown인 경우에만 재계산
-        if not db_status or db_status == 'unknown':
-            temp_status = self._get_temperature_status(temperature)
-        else:
-            temp_status = db_status
-
+        """Convert a DB row to the MQTT payload row format."""
         return {
-            'vehicle_id': row[1],  # vehicle_id 필드 (인덱스 1)
-            'timestamp': datetime.fromtimestamp(row[2]).isoformat() + 'Z',  # timestamp 필드 (인덱스 2)
-            'latitude': row[4],    # latitude 필드 (인덱스 4)
-            'longitude': row[5],   # longitude 필드 (인덱스 5)
-            'altitude': row[6],    # altitude 필드 (인덱스 6)
-            'speed': row[7],       # speed 필드 (인덱스 7)
-            'heading': row[8],     # heading 필드 (인덱스 8)
-            'temperature': temperature,
-            'status': temp_status
+            "cmd": "LTE",
+            "serial": str(self.vehicle_id),
+            "eventDT": datetime.fromtimestamp(row[2]).strftime("%Y-%m-%d %H:%M:%S"),
+            "temperature": float(row[9]) if row[9] is not None else None,
+            "lat": float(row[4]) if row[4] is not None else None,
+            "lng": float(row[5]) if row[5] is not None else None,
+            "battery": 100,
         }
 
     def _get_temperature_status(self, temperature):
-        """온도값에 따른 상태 판단"""
+        """Classify temperature using configured ranges."""
         if temperature is None:
-            return 'unknown'
+            return "unknown"
 
         for status, (min_temp, max_temp) in self.temp_ranges.items():
             if min_temp <= temperature < max_temp:
                 return status
-        return 'normal'
-
-    def _send_to_mysql(self, data):
-        """MySQL 데이터베이스에 직접 저장"""
-        try:
-            import mysql.connector
-
-            # MySQL 연결
-            conn = mysql.connector.connect(
-                host=SERVER_HOST,
-                port=SERVER_PORT,
-                database=SERVER_DATABASE,
-                user=SERVER_USERNAME,
-                password=SERVER_PASSWORD
-            )
-
-            cursor = conn.cursor()
-
-            # GPS + 온도 데이터 저장 (사용자 서버 구조에 맞춤)
-            insert_query = """
-                INSERT INTO gps_temperature_data
-                (vehicle_id, timestamp, latitude, longitude, altitude, speed, heading, temperature, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-
-            for item in data:
-                cursor.execute(insert_query, (
-                    item['vehicle_id'],
-                    item['timestamp'].replace('Z', ''),  # Z 제거
-                    item.get('latitude'),
-                    item.get('longitude'),
-                    item.get('altitude'),
-                    item.get('speed'),
-                    item.get('heading'),
-                    item['temperature'],
-                    item['status']
-                ))
-
-            conn.commit()
-            cursor.close()
-            conn.close()
-
-            logger.info(f"MySQL 데이터베이스에 {len(data)}개 데이터 저장 완료")
-            return True
-
-        except ImportError:
-            logger.warning("mysql-connector-python이 설치되지 않았습니다")
-            return False
-        except Exception as e:
-            logger.error(f"MySQL 저장 실패: {e}")
-            return False
-
-    def _send_to_api(self, data):
-        """HTTP API로 서버에 데이터 전송"""
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {SERVER_API_KEY}',
-            'User-Agent': 'TruckGPS/1.0'
-        }
-
-        payload = {
-            'vehicle_id': self.vehicle_id,
-            'data': data,
-            'sent_at': datetime.now().isoformat()
-        }
-
-        for attempt in range(self.retry_attempts):
-            try:
-                response = requests.post(
-                    SERVER_API_URL,
-                    json=payload,
-                    headers=headers,
-                    timeout=30
-                )
-
-                if response.status_code == 200:
-                    logger.debug(f"서버 응답: {response.json()}")
-                    return True
-                else:
-                    logger.warning(f"서버 오류 응답: {response.status_code} - {response.text}")
-
-            except requests.exceptions.RequestException as e:
-                logger.warning(f"전송 시도 {attempt + 1} 실패: {e}")
-
-                if attempt < self.retry_attempts - 1:
-                    logger.info(f"{self.retry_delay}초 후 재시도...")
-                    time.sleep(self.retry_delay)
-
-        return False
+        return "normal"
 
     def _mark_data_as_sent(self, data_ids):
-        """전송 완료된 GPS+온도 데이터 표시 (중복 전송 방지)"""
+        """Mark rows as sent using the sender thread's persistent DB connection."""
         try:
-            # 각 스레드에서 독립적인 데이터베이스 연결 생성
-            import sqlite3
-            from database import GPSDatabase
-
-            db = GPSDatabase(self.db_path)
-            db.connect()
-            db.mark_gps_temperature_data_as_sent(data_ids)
-            db.close()
+            self._ensure_db_connected()
+            self.db.mark_gps_temperature_data_as_sent(data_ids)
         except Exception as e:
-            logger.error(f"GPS+온도 데이터 전송 완료 표시 실패: {e}")
+            logger.error(f"GPS+temperature sent mark failed: {e}")
 
     def get_stats(self):
-        """전송 통계 반환"""
+        """Return sender stats."""
         return {
             **self.stats,
-            'is_running': self.running,
-            'next_send_in': max(0, self.send_interval - (time.time() - (self.last_send_time or 0)))
+            "is_running": self.running,
+            "next_send_in": max(
+                0,
+                self.send_interval - (time.time() - (self.last_send_time or 0)),
+            ),
         }
 
     def force_send_now(self):
-        """즉시 데이터 전송 (수동 실행용)"""
-        logger.info("수동 데이터 전송 시작")
+        """Send data immediately."""
+        logger.info("Manual send requested")
         self._send_batch()
-
-    def test_connection(self):
-        """서버 연결 테스트"""
-        logger.info("서버 연결 테스트 중...")
-
-        test_data = [{
-            'id': 999999,
-            'vehicle_id': self.vehicle_id,
-            'timestamp': datetime.now().isoformat() + 'Z',
-            'latitude': 0.0,
-            'longitude': 0.0,
-            'temperature': 5.0,
-            'status': 'normal',
-            'test': True
-        }]
-
-        try:
-            # MySQL 연결 시도
-            mysql_success = self._send_to_mysql(test_data)
-
-            # API 연결 시도
-            api_success = self._send_to_api(test_data)
-
-            if mysql_success or api_success:
-                logger.info("✅ 서버 연결 테스트 성공")
-                return True
-            else:
-                logger.error("❌ 서버 연결 테스트 실패")
-                return False
-        except Exception as e:
-            logger.error(f"연결 테스트 오류: {e}")
-            return False
-
-
-def test_server_connection():
-    """서버 연결 테스트 함수"""
-    print("🔗 서버 연결 테스트 시작...")
-
-    # 임시 데이터베이스 연결 (테스트용)
-    class MockDB:
-        def get_latest_data(self, limit): return []
-
-    mock_db = MockDB()
-    sender = ServerSender(mock_db)
-
-    success = sender.test_connection()
-
-    if success:
-        print("✅ 서버 연결 성공!")
-        print(f"차량 ID: {sender.vehicle_id}")
-        print(f"전송 설정: {sender.send_interval}초 간격, 배치 크기: {sender.batch_size}")
-    else:
-        print("❌ 서버 연결 실패!")
-        print("서버 설정을 확인해주세요.")
-
-    return success
 
 
 if __name__ == "__main__":
-    """단독 실행 시 연결 테스트"""
-    test_server_connection()
+    print("ServerSender is started by gps_tracker.py")

@@ -1,0 +1,18 @@
+[Unit]
+Description=Truck GPS tracker service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# install_services.sh 가 현재 사용자/경로로 덮어씁니다
+User=infrax
+Group=infrax
+WorkingDirectory=/home/infrax/truck_gps
+ExecStart=/home/infrax/truck_gps/gps_env/bin/python /home/infrax/truck_gps/gps_tracker.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

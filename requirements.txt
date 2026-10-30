@@ -9,7 +9,14 @@ adafruit-blinka  # Raspberry Pi I2C/SPI 지원
 
 # 서버 전송
 requests==2.31.0  # HTTP 요청용
-mysql-connector-python==8.0.33  # MySQL 연결용
+mysql-connector-python==8.0.33  # MySQL 연결용 (서버 전송용으로 보유)
+paho-mqtt==1.6.1  # MQTT 클라이언트
+
+# 웹 대시보드
+Flask==3.0.3
+
+# 데이터베이스
+# sqlite3는 Python 표준 라이브러리라 별도 설치 불필요
 
 # 다른 온도 센서 (선택 사항)
 # adafruit-circuitpython-dht  # DHT22 센서용

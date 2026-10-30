@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-냉장고 온도 센서 읽기
-DS18B20, DHT22, MCP9600 등 다양한 온도 센서 지원
+냉장고 온도 센서 읽기 — MCP9600, DS18B20, DHT22
 """
 
 import logging
+import subprocess
 import gpiozero
 import time
 import sys
+from config import (
+    TEMP_RANGES,
+    MCP9600_THERMOCOUPLE_TYPE,
+    MCP9600_I2C_ADDRESS,
+    MCP9600_I2C_ADDRESS_CANDIDATES,
+    MCP9600_TC_FILTER,
+)
+from log_utils import log_repeat, verbose
 
 logger = logging.getLogger(__name__)
 
@@ -15,452 +23,227 @@ logger = logging.getLogger(__name__)
 class TemperatureReader:
     """실제 온도 센서에서 데이터를 읽는 클래스"""
 
-    def __init__(self, sensor_type='MCP9600'):
-        """
-        온도 센서 초기화
-
-        Args:
-            sensor_type: 'MCP9600', 'DS18B20', 'DHT22', 'ANALOG' 등
-        """
+    def __init__(self, sensor_type="MCP9600"):
         self.sensor_type = sensor_type
         self.sensor = None
-
-        # 백신 운송 온도 상태 범위 설정
-        self.temp_ranges = {
-            'critical_cold': (-float('inf'), 2.0),
-            'cold': (2.0, 2.5),
-            'normal': (2.5, 7.5),
-            'warm': (7.5, 8.0),
-            'critical_hot': (8.0, float('inf'))
-        }
-
+        self.temp_ranges = TEMP_RANGES
+        self._mcp9600_junctions_logged = False
         self.connect()
 
     def get_temperature_status(self, temperature):
-        """온도값에 따른 상태 판단"""
         if temperature is None:
-            return 'unknown'
-
+            return "unknown"
         for status, (min_temp, max_temp) in self.temp_ranges.items():
             if min_temp <= temperature < max_temp:
                 return status
-        return 'normal'  # 기본값
+        return "normal"
 
     def connect(self):
-        """센서 연결"""
         try:
-            if self.sensor_type == 'MCP9600':
-                # MCP9600 I2C 온도 센서 (열전대 증폭기)
+            if self.sensor_type == "MCP9600":
                 import adafruit_mcp9600
                 import board
                 import busio
-                
-                # I2C 버스 초기화 (10kHz로 설정)
-                i2c = busio.I2C(board.SCL, board.SDA, frequency=10000)
-                
-                # MCP9600 센서 초기화 (I2C 주소: 0x67)
-                # 주소는 센서 설정에 따라 0x60~0x67까지 가능
-                self.sensor = adafruit_mcp9600.MCP9600(i2c, address=0x67)
-                
-                # 열전대 타입 설정 (K-type이 가장 일반적)
-                # self.sensor.thermocouple_type = adafruit_mcp9600.THERMOCOUPLE_TYPE_K
-                
-                logger.info("MCP9600 온도 센서 연결 성공 (I2C 주소: 0x67)")
-            
-            elif self.sensor_type == 'DS18B20':
-                # DS18B20 1-Wire 온도 센서
-                # /sys/bus/w1/devices/28-xxxx/w1_slave 파일 읽기
-                import glob
-                device_folder = glob.glob('/sys/bus/w1/devices/28*')
-                if device_folder:
-                    self.sensor_file = device_folder[0] + '/w1_slave'
-                    logger.info(f"DS18B20 온도 센서 연결 성공: {device_folder[0]}")
+
+                i2c = None
+                for freq in [100000, 10000, 400000]:
+                    try:
+                        i2c = busio.I2C(board.SCL, board.SDA, frequency=freq)
+                        break
+                    except Exception:
+                        if freq == 400000:
+                            raise
+
+                tc_type = MCP9600_THERMOCOUPLE_TYPE
+                tc_filt = max(0, min(7, int(MCP9600_TC_FILTER)))
+                addrs = (
+                    [MCP9600_I2C_ADDRESS]
+                    if MCP9600_I2C_ADDRESS is not None
+                    else list(MCP9600_I2C_ADDRESS_CANDIDATES)
+                )
+
+                last_err = None
+                for address in addrs:
+                    try:
+                        self.sensor = adafruit_mcp9600.MCP9600(
+                            i2c,
+                            address=address,
+                            tctype=tc_type,
+                            tcfilter=tc_filt,
+                        )
+                        logger.debug(
+                            f"MCP9600 연결 (I2C 0x{address:02X}, 열전대={tc_type}, 필터={tc_filt})"
+                        )
+                        break
+                    except Exception as e:
+                        last_err = e
+                        continue
                 else:
-                    raise FileNotFoundError("DS18B20 센서를 찾을 수 없습니다")
-            
-            elif self.sensor_type == 'DHT22':
-                # DHT22 센서 (Adafruit 라이브러리 사용)
+                    raise Exception(f"MCP9600 주소 시도 실패: {last_err}") from last_err
+
+            elif self.sensor_type == "DS18B20":
+                import glob
+
+                device_folders = glob.glob("/sys/bus/w1/devices/28*")
+                if device_folders:
+                    self.sensor_file = device_folders[0] + "/w1_slave"
+                    logger.debug(f"DS18B20 연결: {device_folders[0]}")
+                else:
+                    raise FileNotFoundError(
+                        "DS18B20 없음. 1-Wire 활성화와 /sys/bus/w1/devices 를 확인하세요."
+                    )
+
+            elif self.sensor_type == "DHT22":
                 import adafruit_dht
                 import board
-                self.sensor = adafruit_dht.DHT22(board.D4)  # GPIO4
-                logger.info("DHT22 온도 센서 연결 성공")
 
-            elif self.sensor_type == 'GY21':
-                # GY-21 I2C 온도/습도 센서 (SHT20 기반)
-                import board
-                import busio
-
-                # I2C 버스 초기화 (Adafruit-Blinka 사용, 10kHz로 설정)
-                self.i2c_bus = busio.I2C(board.SCL, board.SDA, frequency=10000)
-
-                # GY-21의 가능한 I2C 주소들 (여러 개 시도)
-                self.possible_addresses = [0x40, 0x41]  # 기본 주소와 대체 주소
-                self.gy21_address = self.possible_addresses[0]  # 우선 첫 번째 주소 사용
-
-                logger.info(f"GY-21 온도 센서 초기화 (시도 주소: {self.possible_addresses})")
-
+                self.sensor = adafruit_dht.DHT22(board.D4)
+                logger.debug("DHT22 연결 (GPIO4)")
             else:
-                raise ValueError(f"지원하지 않는 센서 타입: {self.sensor_type}")
-                
+                raise ValueError(f"지원하지 않는 센서: {self.sensor_type}")
+
         except Exception as e:
-            logger.error(f"온도 센서 연결 실패: {e}")
+            log_repeat(logger, "temp.connect", logging.ERROR, "온도 센서 연결 실패: %s", e)
             raise
-    
+
     def read_mcp9600(self):
-        """MCP9600 센서 읽기"""
+        """
+        Adafruit 드라이버: temperature = 핫 접합(열전대 측), ambient_temperature = 냉 접합(IC 주변).
+        얼음물 시험 시 핫은 약 0°C 근처여야 함. 값이 비정상적으로 높으면 열전대 극성/접촉/타입·배선을 먼저 의심.
+        """
         try:
-            # MCP9600은 열전대 온도와 주변 온도 모두 읽을 수 있음
-            # temperature: 열전대로 측정한 온도 (냉장고 내부 온도)
-            # ambient_temperature: 센서 자체의 주변 온도
-            temperature = self.sensor.temperature
-            return temperature
-        except Exception as e:
-            logger.error(f"MCP9600 읽기 오류: {e}")
-            return None
-    
-    def read_ds18b20(self):
-        """DS18B20 센서 읽기"""
-        try:
-            with open(self.sensor_file, 'r') as f:
-                lines = f.readlines()
-            
-            # 체크섬 확인
-            if lines[0].strip()[-3:] != 'YES':
-                return None
-            
-            # 온도 파싱
-            temp_pos = lines[1].find('t=')
-            if temp_pos != -1:
-                temp_string = lines[1][temp_pos+2:]
-                temp_c = float(temp_string) / 1000.0
-                return temp_c
-        except Exception as e:
-            logger.error(f"DS18B20 읽기 오류: {e}")
-            return None
-    
-    def read_dht22(self):
-        """DHT22 센서 읽기"""
-        try:
-            temperature = self.sensor.temperature
-            # humidity = self.sensor.humidity  # 필요시 사용
-            return temperature
-        except RuntimeError as e:
-            # DHT22는 간혹 읽기 실패
-            logger.debug(f"DHT22 읽기 재시도 필요: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"DHT22 읽기 오류: {e}")
-            return None
-
-    def find_i2c_device(self):
-        """연결된 I2C 장치 찾기"""
-        logger.info("연결된 I2C 장치 검색 중...")
-
-        found_devices = []
-        for address in range(0x03, 0x78):  # 일반적인 I2C 주소 범위
-            try:
-                # 장치가 응답하는지 테스트
-                self.i2c_bus.writeto(address, b'')
-                found_devices.append(address)
-                logger.info(f"주소 0x{address:02X}에 장치 발견")
-            except:
-                pass  # 응답 없음, 계속 진행
-
-        if found_devices:
-            logger.info(f"발견된 I2C 장치들: {[f'0x{addr:02X}' for addr in found_devices]}")
-            return found_devices
-        else:
-            logger.warning("연결된 I2C 장치를 찾을 수 없습니다")
-            return []
-
-    def read_gy21(self):
-        """GY-21 센서 읽기 (SHT20 기반)"""
-        try:
-            # 먼저 연결된 장치들 확인
-            devices = self.find_i2c_device()
-            if not devices:
-                logger.error("읽을 수 있는 I2C 장치가 없습니다")
-                return None
-
-            # 발견된 장치들 중에서 시도
-            for device_addr in devices:
+            hot = self.sensor.temperature
+            if not self._mcp9600_junctions_logged:
+                self._mcp9600_junctions_logged = True
                 try:
-                    logger.info(f"장치 0x{device_addr:02X}에서 온도 읽기 시도...")
-
-                    # 온도 측정 명령 전송 (0xF3)
-                    self.i2c_bus.writeto(device_addr, bytes([0xF3]))
-                    time.sleep(0.1)  # 측정 완료 대기 (최소 85ms 필요)
-
-                    # 2바이트 데이터 읽기
-                    buffer = bytearray(2)
-                    self.i2c_bus.readfrom_into(device_addr, buffer)
-
-                    logger.info(f"수신된 데이터: {list(buffer)}")
-
-                    # Raw 데이터 결합
-                    raw_temp = (buffer[0] << 8) + buffer[1]
-
-                    # 온도 계산 (SHT20 공식)
-                    temperature = -46.85 + 175.72 * (raw_temp / 65536.0)
-
-                    logger.info(f"계산된 온도: {temperature:.2f}°C")
-                    return temperature
-
-                except Exception as e:
-                    logger.warning(f"장치 0x{device_addr:02X} 읽기 실패: {e}")
-                    continue
-
-            logger.error("모든 장치에서 읽기 실패")
-            return None
-
+                    amb = self.sensor.ambient_temperature
+                    delta = self.sensor.delta_temperature
+                    logger.debug(
+                        "MCP9600 점검(1회): 핫접합=%.2f°C, 냉접합(주변)=%.2f°C, 델타=%.2f°C — "
+                        "얼음 시험 시 핫은 ~0°C대가 정상입니다.",
+                        hot,
+                        amb,
+                        delta,
+                    )
+                except Exception:
+                    logger.debug("MCP9600 핫접합=%.2f°C (냉접합 읽기 생략)", hot)
+            return hot
         except Exception as e:
-            logger.error(f"GY-21 읽기 오류: {e}")
+            log_repeat(logger, "temp.mcp9600", logging.ERROR, "MCP9600 읽기 오류: %s", e)
             return None
-    
+
+    def read_ds18b20(self):
+        try:
+            with open(self.sensor_file, "r") as f:
+                lines = f.readlines()
+            if lines[0].strip()[-3:] != "YES":
+                return None
+            temp_pos = lines[1].find("t=")
+            if temp_pos != -1:
+                return float(lines[1][temp_pos + 2 :]) / 1000.0
+        except Exception as e:
+            log_repeat(logger, "temp.ds18b20", logging.ERROR, "DS18B20 읽기 오류: %s", e)
+        return None
+
+    def read_dht22(self):
+        try:
+            return self.sensor.temperature
+        except RuntimeError as e:
+            verbose(logger, "DHT22 재시도: %s", e)
+            return None
+        except Exception as e:
+            log_repeat(logger, "temp.dht22", logging.ERROR, "DHT22 읽기 오류: %s", e)
+            return None
+
     def read(self):
-        """온도 읽기"""
-        temperature = None
-
-        if self.sensor_type == 'MCP9600':
-            temperature = self.read_mcp9600()
-        elif self.sensor_type == 'DS18B20':
-            temperature = self.read_ds18b20()
-        elif self.sensor_type == 'DHT22':
-            temperature = self.read_dht22()
-        elif self.sensor_type == 'GY21':
-            temperature = self.read_gy21()
-
-        return temperature
+        if self.sensor_type == "MCP9600":
+            return self.read_mcp9600()
+        if self.sensor_type == "DS18B20":
+            return self.read_ds18b20()
+        if self.sensor_type == "DHT22":
+            return self.read_dht22()
+        return None
 
     def read_with_status(self):
-        """온도와 상태 정보를 함께 반환"""
         temperature = self.read()
-        status = self.get_temperature_status(temperature)
+        return {"temperature": temperature, "status": self.get_temperature_status(temperature)}
 
-        return {
-            'temperature': temperature,
-            'status': status
-        }
-    
     def close(self):
-        """센서 연결 종료"""
-        if self.sensor_type == 'DHT22' and self.sensor:
+        if self.sensor_type == "DHT22" and self.sensor:
             self.sensor.exit()
-        # GY21의 경우 busio.I2C는 특별한 종료 처리 불필요
-        # (Adafruit-Blinka의 I2C 객체는 자동 관리됨)
-        logger.info("온도 센서 연결 종료")
+        logger.debug("온도 센서 연결 종료")
 
     def gpio_debug_info(self):
-        """GPIO 디버깅 정보 출력"""
-        logger.info("=== GPIO 디버깅 정보 ===")
-
+        """I2C(MCP9600)는 bus 점유 중이므로 SDA/SCL을 gpiozero로 읽지 않음."""
+        logger.info("=== GPIO 디버깅 ===")
         try:
-            # I2C 관련 핀들 확인 (SCL=3, SDA=2)
-            scl_pin = gpiozero.Button(3)  # GPIO 3 (SCL)
-            sda_pin = gpiozero.Button(2)  # GPIO 2 (SDA)
-
-            logger.info(f"SCL 핀 (GPIO 3) 상태: {'HIGH' if scl_pin.value else 'LOW'}")
-            logger.info(f"SDA 핀 (GPIO 2) 상태: {'HIGH' if sda_pin.value else 'LOW'}")
-
-            # DHT22 센서 핀 확인 (GPIO 4)
-            if self.sensor_type == 'DHT22':
-                dht_pin = gpiozero.Button(4)  # GPIO 4
-                logger.info(f"DHT22 핀 (GPIO 4) 상태: {'HIGH' if dht_pin.value else 'LOW'}")
-
-            # 1-Wire 핀 확인 (GPIO 4 - DS18B20용)
-            if self.sensor_type == 'DS18B20':
-                ow_pin = gpiozero.Button(4)  # GPIO 4
-                logger.info(f"1-Wire 핀 (GPIO 4) 상태: {'HIGH' if ow_pin.value else 'LOW'}")
-
-            scl_pin.close()
-            sda_pin.close()
-            if self.sensor_type in ['DHT22', 'DS18B20']:
-                dht_pin.close()
-
+            if self.sensor_type == "MCP9600":
+                logger.info("MCP9600은 I2C(SDA/SCL) 사용 — gpiozero로 해당 핀을 잡지 않습니다.")
+            if self.sensor_type == "DHT22":
+                p = gpiozero.Button(4)
+                logger.info(f"DHT22 GPIO4: {'HIGH' if p.value else 'LOW'}")
+                p.close()
+            if self.sensor_type == "DS18B20":
+                p = gpiozero.Button(4)
+                logger.info(f"1-Wire GPIO4: {'HIGH' if p.value else 'LOW'}")
+                p.close()
         except Exception as e:
             logger.error(f"GPIO 디버깅 오류: {e}")
 
-    def gpio_test_signal(self, pin_number, duration=1.0):
-        """GPIO 핀에 테스트 신호 전송"""
-        logger.info(f"=== GPIO {pin_number}번 핀 테스트 신호 전송 ===")
-
-        try:
-            # LED나 간단한 출력 장치로 테스트
-            test_pin = gpiozero.DigitalOutputDevice(pin_number)
-
-            logger.info(f"{pin_number}번 핀에 HIGH 신호 전송 ({duration}초)")
-            test_pin.on()
-            time.sleep(duration)
-
-            logger.info(f"{pin_number}번 핀에 LOW 신호 전송")
-            test_pin.off()
-
-            test_pin.close()
-            logger.info(f"GPIO {pin_number}번 핀 테스트 완료")
-
-        except Exception as e:
-            logger.error(f"GPIO 테스트 신호 전송 오류: {e}")
-
     def check_i2c_communication(self):
-        """I2C 통신 상태 확인"""
-        logger.info("=== I2C 통신 상태 확인 ===")
-
+        logger.info("=== i2cdetect ===")
         try:
-            # I2C 장치 목록 확인
-            import subprocess
-            result = subprocess.run(['i2cdetect', '-y', '1'], capture_output=True, text=True)
-
-            if result.returncode == 0:
-                logger.info("I2C 장치 목록:")
-                logger.info(result.stdout)
+            r = subprocess.run(["i2cdetect", "-y", "1"], capture_output=True, text=True)
+            if r.returncode == 0:
+                logger.info(r.stdout)
             else:
-                logger.error(f"I2C 감지 오류: {result.stderr}")
-
+                logger.error(r.stderr or "i2cdetect 실패")
         except FileNotFoundError:
-            logger.error("i2cdetect 명령어를 찾을 수 없습니다")
+            logger.error("i2cdetect 없음")
         except Exception as e:
-            logger.error(f"I2C 확인 중 오류 발생: {e}")
+            logger.error(f"i2cdetect 오류: {e}")
 
     def sensor_connection_test(self):
-        """센서 연결 상태 테스트"""
-        logger.info(f"=== {self.sensor_type} 센서 연결 테스트 ===")
-
-        if self.sensor_type == 'GY21':
-            try:
-                # 먼저 모든 연결된 I2C 장치 검색
-                logger.info("연결된 모든 I2C 장치 검색...")
-                devices = self.find_i2c_device()
-
-                if devices:
-                    logger.info(f"발견된 장치들: {[f'0x{addr:02X}' for addr in devices]}")
-
-                    # 각 장치에서 온도 읽기 시도
-                    for device_addr in devices:
-                        try:
-                            logger.info(f"장치 0x{device_addr:02X}에서 온도 읽기 시도...")
-
-                            # 온도 측정 명령 전송 (0xF3)
-                            self.i2c_bus.writeto(device_addr, bytes([0xF3]))
-                            time.sleep(0.1)
-
-                            buffer = bytearray(2)
-                            self.i2c_bus.readfrom_into(device_addr, buffer)
-
-                            logger.info(f"장치 0x{device_addr:02X} 응답 데이터: {list(buffer)}")
-
-                            # 온도 계산 시도
-                            raw_temp = (buffer[0] << 8) + buffer[1]
-                            temperature = -46.85 + 175.72 * (raw_temp / 65536.0)
-
-                            logger.info(f"장치 0x{device_addr:02X} 온도: {temperature:.2f}°C")
-                            logger.info("GY-21 센서 연결 정상")
-
-                        except Exception as e:
-                            logger.warning(f"장치 0x{device_addr:02X} 읽기 실패: {e}")
-                else:
-                    logger.error("연결된 I2C 장치를 찾을 수 없습니다")
-
-            except Exception as e:
-                logger.error(f"GY-21 센서 연결 테스트 오류: {e}")
-
-        elif self.sensor_type == 'MCP9600':
-            try:
-                # MCP9600 센서가 응답하는지 확인
-                temp = self.sensor.temperature
-                logger.info(f"MCP9600 센서 응답 온도: {temp}°C")
-                logger.info("MCP9600 센서 연결 정상")
-
-            except Exception as e:
-                logger.error(f"MCP9600 센서 연결 오류: {e}")
-
-        elif self.sensor_type == 'DHT22':
-            try:
-                # DHT22 센서가 응답하는지 확인
-                temp = self.sensor.temperature
-                logger.info(f"DHT22 센서 응답 온도: {temp}°C")
-                logger.info("DHT22 센서 연결 정상")
-
-            except Exception as e:
-                logger.error(f"DHT22 센서 연결 오류: {e}")
-
-        elif self.sensor_type == 'DS18B20':
-            try:
-                # DS18B20 센서 파일 존재 확인
+        logger.info(f"=== {self.sensor_type} 연결 테스트 ===")
+        try:
+            if self.sensor_type == "MCP9600":
+                t = self.sensor.temperature
+                logger.info(f"MCP9600 온도: {t}°C")
+            elif self.sensor_type == "DHT22":
+                t = self.sensor.temperature
+                logger.info(f"DHT22 온도: {t}°C")
+            elif self.sensor_type == "DS18B20":
                 import glob
-                device_folder = glob.glob('/sys/bus/w1/devices/28*')
 
-                if device_folder:
-                    logger.info(f"DS18B20 센서 발견: {device_folder[0]}")
-                    logger.info("DS18B20 센서 연결 정상")
+                dev = glob.glob("/sys/bus/w1/devices/28*")
+                if dev:
+                    logger.info(f"DS18B20: {dev[0]}")
                 else:
-                    logger.error("DS18B20 센서를 찾을 수 없습니다")
+                    logger.error("DS18B20 장치 없음")
+        except Exception as e:
+            logger.error(f"연결 테스트 오류: {e}")
 
-            except Exception as e:
-                logger.error(f"DS18B20 센서 연결 오류: {e}")
 
-
-def test_temperature_sensor(sensor_type='GY21'):
-    """온도 센서 단독 테스트"""
-    print(f"=== {sensor_type} 온도 센서 단독 테스트 ===")
-
-    # 로깅 설정
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
+def test_temperature_sensor(sensor_type="MCP9600"):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     try:
         reader = TemperatureReader(sensor_type=sensor_type)
-        print(f"{sensor_type} 센서 초기화 완료")
-
-        # GPIO 상태 확인
-        print("\n=== GPIO 상태 확인 ===")
         reader.gpio_debug_info()
-
-        # I2C 통신 상태 확인
-        print("\n=== I2C 통신 상태 확인 ===")
         reader.check_i2c_communication()
-
-        # 센서 연결 테스트
-        print("\n=== 센서 연결 테스트 ===")
         reader.sensor_connection_test()
-
-        # 실제 온도 읽기 시도
-        print("\n=== 온도 읽기 테스트 ===")
-        for i in range(3):  # 3번 시도
-            print(f"시도 {i+1}/3...")
-            temperature = reader.read()
-            if temperature is not None:
-                print(f"✅ 성공! 온도: {temperature:.2f}°C")
+        for i in range(3):
+            t = reader.read()
+            if t is not None:
+                print(f"온도: {t:.2f}°C")
                 break
-            else:
-                print("❌ 읽기 실패")
             time.sleep(1)
-
         reader.close()
         return True
-
     except Exception as e:
-        print(f"테스트 실패: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"실패: {e}")
         return False
 
 
 if __name__ == "__main__":
-    """단독 실행 시 테스트 모드"""
-    sensor_type = 'GY21'  # 기본값
-
-    # 명령줄 인자로 센서 타입 지정 가능
-    if len(sys.argv) > 1:
-        sensor_type = sys.argv[1]
-
-    print(f"온도 센서 타입: {sensor_type}")
-    success = test_temperature_sensor(sensor_type)
-
-    if success:
-        print("\n🎉 테스트 완료!")
-    else:
-        print("\n💥 테스트 실패!")
-
-
+    st = sys.argv[1] if len(sys.argv) > 1 else "MCP9600"
+    test_temperature_sensor(sensor_type=st)

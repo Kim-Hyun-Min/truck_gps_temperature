@@ -1,0 +1,914 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1280, height=800, initial-scale=1">
+    <title>백신 수송차량 모니터링</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <style>
+      :root {
+        --bg: #0b1325;
+        --card: #152238;
+        --card-2: #1b2a42;
+        --line: #2f3f5d;
+        --text: #e6edf7;
+        --muted: #a9b6cb;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+        --danger: #ef4444;
+        --accent: #3b82f6;
+      }
+      * { box-sizing: border-box; cursor: none !important; }
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        cursor: none !important;
+      }
+      body {
+        background: linear-gradient(180deg, #0a1220 0%, #0b1325 100%);
+        color: var(--text);
+        font-family: "Noto Sans CJK KR", "NanumGothic", "Malgun Gothic", "Segoe UI", Roboto, Arial, sans-serif;
+      }
+      #scaleStage {
+        width: 100vw;
+        height: 100vh;
+        position: relative;
+        overflow: hidden;
+      }
+      #scaleRoot {
+        width: 1280px;
+        height: 800px;
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        display: flex;
+        flex-direction: column;
+        transform: translate(-50%, calc(-50% + var(--ui-offset-y, 0px))) scale(var(--ui-scale, 1));
+        transform-origin: center center;
+      }
+      #scaleRoot > .container {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+        margin-top: 12px;
+        margin-bottom: 8px;
+        min-height: 0;
+      }
+      #scaleRoot .header {
+        padding-top: 12px;
+      }
+      #scaleRoot .chart-card {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      #scaleRoot .chart-container {
+        flex: 1;
+        height: auto;
+        min-height: 160px;
+      }
+      /* 10.1인치(1280×800 등) 가로형: 가로는 넓게, 세로는 vh 기준으로 압축 */
+      .container {
+        width: 100%;
+        max-width: min(100%, 1320px);
+        margin: clamp(6px, 1vh, 14px) auto clamp(8px, 1.2vh, 18px);
+        padding: 0 clamp(10px, 1.8vw, 20px);
+      }
+      .panel {
+        background: linear-gradient(180deg, var(--card), var(--card-2));
+        border: 1px solid var(--line);
+        border-radius: 10px;
+      }
+      .header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: clamp(8px, 1.2vh, 14px) clamp(12px, 1.5vw, 18px);
+        margin-bottom: clamp(6px, 0.8vh, 10px);
+      }
+      .title {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      .title h1 {
+        font-size: clamp(17px, 2.4vh, 22px);
+        margin: 0;
+        line-height: 1.2;
+      }
+      .sub {
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .status {
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .conn-ok {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--ok);
+        font-weight: 600;
+      }
+      .icon-svg {
+        flex-shrink: 0;
+        display: block;
+        color: #7dd3fc;
+        opacity: 0.95;
+        filter: drop-shadow(0 0 6px rgba(125, 211, 252, 0.25));
+      }
+      .title .icon-svg {
+        width: clamp(30px, 4.2vh, 38px);
+        height: clamp(30px, 4.2vh, 38px);
+      }
+      .conn-ok .icon-svg {
+        width: 24px;
+        height: 24px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(200px, 0.88fr) minmax(280px, 1.22fr);
+        gap: clamp(8px, 1.2vw, 12px);
+        margin-bottom: clamp(6px, 0.8vh, 10px);
+        align-items: stretch;
+      }
+      .card {
+        padding: clamp(10px, 1.4vh, 14px) clamp(10px, 1.2vw, 14px);
+      }
+      .card-temp,
+      .card-gps {
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .card-temp .card-title,
+      .card-gps .card-title {
+        flex-shrink: 0;
+      }
+      .card-title {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        margin: 0 0 clamp(8px, 1vh, 12px) 0;
+        font-size: clamp(17px, 2.2vh, 21px);
+        font-weight: 700;
+        text-align: center;
+      }
+      .card-title .icon-svg {
+        width: clamp(22px, 3vh, 28px);
+        height: clamp(22px, 3vh, 28px);
+        flex-shrink: 0;
+        color: inherit;
+        opacity: 0.95;
+      }
+      .inset-box {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+      }
+      .temp-stack {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+        max-width: 100%;
+        flex: 1;
+        min-height: 0;
+      }
+      .temp-main-box {
+        width: 100%;
+        padding: clamp(10px, 1.5vh, 16px) 8px;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        min-height: clamp(110px, 18vh, 150px);
+      }
+      .temp-value {
+        font-size: clamp(34px, min(7vw, 9vh), 52px);
+        font-weight: 800;
+        margin: 4px 0 8px;
+        line-height: 1.1;
+        transition: color 0.25s ease;
+      }
+      .temp-value.temp-accent {
+        color: var(--accent);
+      }
+      .temp-value.temp-warn {
+        color: #fbbf24;
+      }
+      .temp-value.temp-hot {
+        color: #ff8585;
+      }
+      .temp-value.temp-cold {
+        color: #7dd3fc;
+      }
+      .temp-main-box .badge {
+        margin-top: 4px;
+      }
+      .range-box {
+        width: 100%;
+        flex: 1;
+        min-height: clamp(44px, 7vh, 56px);
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 500;
+        padding: 12px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* 고온 위험(critical_hot): 냉장고 카드 전체 강조 */
+      .panel.card-temp.card-temp-danger {
+        background: linear-gradient(180deg, rgba(100, 20, 28, 0.92), rgba(55, 12, 18, 0.96));
+        border-color: rgba(248, 113, 113, 0.55);
+        box-shadow: inset 0 0 40px rgba(220, 38, 38, 0.15);
+      }
+      .panel.card-temp.card-temp-danger .card-title {
+        color: #fecdd3;
+      }
+      .panel.card-temp.card-temp-danger .temp-value.temp-hot {
+        text-shadow: 0 0 24px rgba(239, 68, 68, 0.35);
+      }
+      .panel.card-temp.card-temp-danger .inset-box {
+        background: rgba(0, 0, 0, 0.22);
+        border-color: rgba(248, 113, 113, 0.4);
+      }
+      .panel.card-temp.card-temp-danger .range-box {
+        color: #fca5a5;
+      }
+      /* 주의: 살짝 주황 톤 (선택) */
+      .panel.card-temp.card-temp-warn {
+        background: linear-gradient(180deg, rgba(80, 50, 12, 0.85), rgba(45, 30, 8, 0.92));
+        border-color: rgba(245, 158, 11, 0.45);
+      }
+      .panel.card-temp.card-temp-warn .card-title {
+        color: #fde68a;
+      }
+      .badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 8px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .badge-danger { background: rgba(239, 68, 68, 0.2); color: #ff7b7b; }
+      .badge-warn { background: rgba(245, 158, 11, 0.2); color: #ffd37f; }
+      .badge-ok { background: rgba(34, 197, 94, 0.2); color: #7ef2a6; }
+      .gps-stack {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+      }
+      .gps-wrap {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        flex-shrink: 0;
+      }
+      .gps-box {
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: clamp(8px, 1.2vh, 12px) 8px;
+        text-align: center;
+        min-height: clamp(88px, 14vh, 112px);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+      .gps-label { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+      .gps-val {
+        font-size: clamp(18px, min(2.8vw, 4.5vh), 32px);
+        font-weight: 700;
+        word-break: break-all;
+        line-height: 1.15;
+      }
+      .chart-card {
+        margin-bottom: clamp(6px, 0.8vh, 10px);
+        padding: clamp(8px, 1.2vh, 14px) clamp(10px, 1.2vw, 14px);
+      }
+      .chart-title {
+        margin: 0 0 clamp(6px, 1vh, 12px) 0;
+        font-size: clamp(17px, 2.2vh, 22px);
+        font-weight: 700;
+        text-align: center;
+      }
+      .chart-container {
+        position: relative;
+        /* 가로형 패널: 세로는 화면 비율에 맞춤 (고정 340px 제거) */
+        height: clamp(200px, min(32vh, 34vw), 300px);
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 6px;
+      }
+      .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: clamp(8px, 1vw, 10px);
+      }
+      .kpi {
+        padding: clamp(8px, 1.2vh, 14px) clamp(8px, 1vw, 12px);
+        text-align: center;
+        min-height: clamp(72px, 12vh, 96px);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.02));
+      }
+      .kpi .label {
+        color: var(--muted);
+        font-size: 13px;
+        margin-bottom: 8px;
+      }
+      .kpi .value {
+        font-size: clamp(22px, 3.8vh, 30px);
+        font-weight: 800;
+      }
+      .kpi .value.temp-accent {
+        color: var(--accent);
+      }
+      .kpi .value.kpi-temp-hot {
+        color: #ff8585;
+      }
+      .kpi .value.kpi-temp-warn {
+        color: #fbbf24;
+      }
+      .kpi .value.kpi-temp-cold {
+        color: #7dd3fc;
+      }
+      .kpi .value.status-ok {
+        color: var(--ok);
+        font-size: 22px;
+      }
+      .kpi .value.status-warn {
+        color: var(--warn);
+        font-size: 22px;
+      }
+      .kpi .value.status-danger {
+        color: #ff7b7b;
+        font-size: 22px;
+      }
+      .kpi .value.sensor-ok {
+        color: var(--ok);
+        font-size: 22px;
+      }
+      .kpi .value.sensor-bad {
+        color: #f87171;
+        font-size: 22px;
+      }
+      .gps-meta-combined {
+        flex: 1;
+        min-height: clamp(48px, 8vh, 72px);
+        text-align: center;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+      }
+      .gps-meta-combined .location-line {
+        color: #8cc3ff;
+        font-weight: 600;
+        font-size: 15px;
+        line-height: 1.45;
+        margin: 0;
+      }
+      .gps-meta-combined .update-line-inner {
+        margin-top: 10px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(255, 255, 255, 0.1);
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 500;
+        line-height: 1.4;
+        width: 100%;
+      }
+      /* 10.1인치 랜드스케이프 전용: 세로 픽셀 부족 시 한 단계 더 압축 */
+      @media (min-width: 1024px) and (max-height: 860px) {
+        .container {
+          margin-top: 4px;
+          margin-bottom: 6px;
+        }
+        .chart-container {
+          height: clamp(188px, 30vh, 252px);
+        }
+        .temp-main-box {
+          min-height: 100px;
+        }
+        .gps-box {
+          min-height: 80px;
+        }
+        .kpi {
+          min-height: 64px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="scaleStage">
+    <div id="scaleRoot">
+    <div class="container">
+      <div class="panel header">
+        <div class="title">
+          <svg class="icon-svg icon-truck" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <title>수송 트럭</title>
+            <rect x="1.5" y="8" width="10" height="6.5" rx="0.8" fill="none" stroke="currentColor" stroke-width="1.25"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" stroke-linecap="round"
+              d="M11.5 8h4.3l2.4 2.3V14.5h-6.7V8z"/>
+            <line x1="2" y1="17.5" x2="20" y2="17.5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+            <circle cx="6.5" cy="17.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.25"/>
+            <circle cx="16" cy="17.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.25"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.05" stroke-linecap="round"
+              d="M14.2 8.5v2.3h2.4"/>
+          </svg>
+          <div>
+            <h1>백신 수송차량 모니터링</h1>
+            <div class="sub">Device ID: <span id="vehicleId">-</span></div>
+          </div>
+        </div>
+        <div class="status">
+          <div class="conn-ok" id="connWrap">
+            <svg class="icon-svg icon-link" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <title>네트워크 연결</title>
+              <!-- 신호 세로 막대 (와이파이 호 대신 — 연결/세기 느낌) -->
+              <path fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round"
+                d="M5 19V14 M9.5 19V9 M14 19V12 M18.5 19V6"/>
+            </svg>
+            <span id="internetText">연결 확인중</span>
+          </div>
+          <div id="nowTime">-</div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="panel card card-temp" id="cardTemp">
+          <div class="card-title">
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <title>온도계</title>
+              <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                d="M14 4v10.5a4 4 0 1 1-4 0V4a2 2 0 1 1 4 0z"/>
+            </svg>
+            <span>냉장고 온도</span>
+          </div>
+          <div class="temp-stack">
+            <div class="inset-box temp-main-box">
+              <div class="temp-value" id="tempValue">-</div>
+              <div id="tempBadge" class="badge">상태 확인중</div>
+            </div>
+            <div class="inset-box range-box">권장 범위 2°C ~ 8°C</div>
+          </div>
+        </div>
+
+        <div class="panel card card-gps">
+          <div class="card-title">
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <title>GPS 위치</title>
+              <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                d="M12 21s7-4.5 7-11a7 7 0 1 0-14 0c0 6.5 7 11 7 11z"/>
+              <circle cx="12" cy="10" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/>
+            </svg>
+            <span>실시간 GPS 위치</span>
+          </div>
+          <div class="gps-stack">
+            <div class="gps-wrap">
+              <div class="gps-box">
+                <div class="gps-label">위도</div>
+                <div class="gps-val" id="latVal">-</div>
+              </div>
+              <div class="gps-box">
+                <div class="gps-label">경도</div>
+                <div class="gps-val" id="lonVal">-</div>
+              </div>
+            </div>
+            <div class="inset-box gps-meta-combined">
+              <div class="location-line" id="locationText">현재 위치: -</div>
+              <div class="update-line-inner" id="updateText">업데이트: -</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel chart-card">
+        <h2 class="chart-title">온도 히스토리</h2>
+        <div class="chart-container">
+          <canvas id="tempChart"></canvas>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        <div class="panel kpi">
+          <div class="label">현재 온도</div>
+          <div class="value" id="kpiTemp">-</div>
+        </div>
+        <div class="panel kpi">
+          <div class="label">상태</div>
+          <div class="value" id="kpiStatus">-</div>
+        </div>
+        <div class="panel kpi">
+          <div class="label">온도계 센서</div>
+          <div class="value" id="kpiSensor">-</div>
+        </div>
+        <div class="panel kpi">
+          <div class="label">데이터</div>
+          <div class="value" id="kpiCount">-</div>
+        </div>
+      </div>
+    </div>
+    </div>
+    </div>
+
+    <script>
+      const DESIGN_W = 1280;
+      const DESIGN_H = 800;
+
+      function applyViewportScale() {
+        const scaleW = window.innerWidth / DESIGN_W;
+        const scaleH = window.innerHeight / DESIGN_H;
+        const scale = scaleH;
+        document.documentElement.style.setProperty("--ui-scale", String(scale));
+        document.documentElement.style.setProperty("--ui-offset-y", "8px");
+        if (typeof chart !== "undefined" && chart) {
+          chart.resize();
+        }
+      }
+
+      window.addEventListener("resize", applyViewportScale);
+
+      /** X축 시간 창(ms) — 서버 DASHBOARD_TEMP_CHART_SECONDS 와 동일 */
+      const CHART_WINDOW_MS = {{ chart_window_seconds | default(90) }} * 1000;
+      /** X축 눈금 간격(ms) — 분 단위 라벨과 맞추려면 1분 권장 */
+      const X_TICK_STEP_MS = 60 * 1000;
+      /** 마지막 샘플 이후 오른쪽 여백(ms) — “현재 시각”이 아니라 데이터 끝에 맞춰 빈 구간 방지 */
+      const CHART_RIGHT_PAD_MS = 0 * 1000;
+      const CHART_LEFT_PAD_MS = 2000;
+
+      /** 차트 축·툴팁용 시각: 분까지, a.m. / p.m. */
+      function formatChartTimeLabel(ms) {
+        const d = new Date(ms);
+        let h = d.getHours();
+        const m = String(d.getMinutes()).padStart(2, "0");
+        const isPm = h >= 12;
+        h = h % 12;
+        if (h === 0) h = 12;
+        return `${h}:${m} ${isPm ? "p.m." : "a.m."}`;
+      }
+
+      const state = {
+        latest: null,
+        series: []
+      };
+
+      const el = (id) => document.getElementById(id);
+      const fmtNum = (v, d=6) => (v === null || v === undefined || Number.isNaN(Number(v))) ? "-" : Number(v).toFixed(d);
+      const fmtTemp = (v) => (v === null || v === undefined || Number.isNaN(Number(v))) ? "-" : `${Number(v).toFixed(1)}°C`;
+
+      function statusBadge(status) {
+        const s = (status || "").toLowerCase();
+        if (s.includes("critical") || s.includes("위험")) return ["고온 위험", "badge-danger"];
+        if (s.includes("warm") || s.includes("cold")) return ["주의", "badge-warn"];
+        return ["정상", "badge-ok"];
+      }
+
+      const ctx = el("tempChart").getContext("2d");
+      const chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          datasets: [
+            {
+              label: "온도",
+              data: [],
+              borderColor: "#3b82f6",
+              backgroundColor: "rgba(59,130,246,0.18)",
+              borderWidth: 2,
+              pointRadius: 0,
+              tension: 0.25,
+              fill: false,
+              order: 2
+            },
+            {
+              label: "권장 하한 2°C",
+              data: [],
+              borderColor: "rgba(59, 130, 246, 0.85)",
+              backgroundColor: "transparent",
+              borderWidth: 1.5,
+              borderDash: [8, 5],
+              pointRadius: 0,
+              tension: 0,
+              fill: false,
+              order: 1
+            },
+            {
+              label: "권장 상한 8°C",
+              data: [],
+              borderColor: "rgba(239, 68, 68, 0.85)",
+              backgroundColor: "transparent",
+              borderWidth: 1.5,
+              borderDash: [8, 5],
+              pointRadius: 0,
+              tension: 0,
+              fill: false,
+              order: 1
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: "nearest", intersect: false },
+          scales: {
+            x: {
+              type: "linear",
+              min: undefined,
+              max: undefined,
+              afterBuildTicks: (axis) => {
+                const step = X_TICK_STEP_MS;
+                const min = axis.min;
+                const max = axis.max;
+                if (max - min <= 0) return;
+                const first = Math.ceil(min / step) * step;
+                const ticks = [];
+                for (let v = first; v <= max + 0.5; v += step) {
+                  ticks.push({ value: v });
+                }
+                if (ticks.length === 0) {
+                  ticks.push({ value: min });
+                }
+                axis.ticks = ticks;
+              },
+              ticks: {
+                color: "#9fb0ca",
+                autoSkip: false,
+                maxRotation: 0,
+                minRotation: 0,
+                font: {
+                  family: "ui-monospace, 'Cascadia Mono', 'Consolas', monospace",
+                  size: 11
+                },
+                callback: (value) => formatChartTimeLabel(value)
+              },
+              grid: { color: "rgba(255,255,255,0.08)" }
+            },
+            y: {
+              min: undefined,
+              max: undefined,
+              ticks: {
+                color: "#9fb0ca",
+                callback: (v) => (Number.isInteger(v) ? v : Number(v).toFixed(1))
+              },
+              grid: { color: "rgba(255,255,255,0.08)" }
+            }
+          },
+          plugins: {
+            legend: {
+              labels: {
+                color: "#cdd9eb",
+                usePointStyle: true,
+                boxWidth: 0
+              }
+            },
+            tooltip: {
+              callbacks: {
+                title: (items) => {
+                  if (!items.length) return "";
+                  const x = items[0].parsed.x;
+                  return formatChartTimeLabel(x);
+                },
+                label: (ctx) => {
+                  const y = ctx.parsed.y;
+                  if (ctx.datasetIndex === 0) return ` 온도: ${Number(y).toFixed(1)}°C`;
+                  return ` ${ctx.dataset.label}`;
+                }
+              }
+            }
+          }
+        }
+      });
+      applyViewportScale();
+
+      function computeYRange(points) {
+        const ys = points.map((p) => p.y).filter((y) => y != null && !Number.isNaN(Number(y)));
+        if (ys.length === 0) return { min: -1, max: 11 };
+        const lo = Math.min(...ys);
+        const hi = Math.max(...ys);
+        const span = hi - lo;
+        const pad = span < 0.4 ? 0.35 : span < 1.2 ? 0.6 : 1.1;
+        let yMin = Math.min(2, lo - pad);
+        let yMax = Math.max(8, hi + pad);
+        yMin = Math.floor(yMin * 10) / 10;
+        yMax = Math.ceil(yMax * 10) / 10;
+        return { min: yMin, max: yMax };
+      }
+
+      function setRefLines(minX, maxX) {
+        const ds = chart.data.datasets;
+        if (minX == null || maxX == null) {
+          ds[1].data = [];
+          ds[2].data = [];
+          return;
+        }
+        if (minX === maxX) {
+          const pad = 120000;
+          minX -= pad;
+          maxX += pad;
+        }
+        ds[1].data = [
+          { x: minX, y: 2 },
+          { x: maxX, y: 2 }
+        ];
+        ds[2].data = [
+          { x: minX, y: 8 },
+          { x: maxX, y: 8 }
+        ];
+      }
+
+      async function fetchJson(url) {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`${url} ${res.status}`);
+        return res.json();
+      }
+
+      async function refreshLatest() {
+        const latest = await fetchJson("/api/latest");
+        state.latest = latest || {};
+
+        el("vehicleId").textContent = latest.vehicle_id || "-";
+        el("tempValue").textContent = fmtTemp(latest.temperature);
+        el("latVal").textContent = fmtNum(latest.latitude, 6);
+        el("lonVal").textContent = fmtNum(latest.longitude, 6);
+        el("updateText").textContent = `업데이트: ${latest.datetime || "-"}`;
+
+        const [badgeText, badgeClass] = statusBadge(latest.status);
+        const badge = el("tempBadge");
+        badge.textContent = badgeText;
+        badge.className = `badge ${badgeClass}`;
+
+        const stLow = (latest.status || "").toLowerCase();
+        const isHotDanger =
+          badgeClass === "badge-danger" && !stLow.includes("critical_cold");
+        const isColdDanger =
+          badgeClass === "badge-danger" && stLow.includes("critical_cold");
+
+        const cardTemp = el("cardTemp");
+        cardTemp.classList.remove("card-temp-danger", "card-temp-warn");
+        if (isHotDanger) {
+          cardTemp.classList.add("card-temp-danger");
+        } else if (badgeClass === "badge-warn") {
+          cardTemp.classList.add("card-temp-warn");
+        }
+
+        let tempColorClass = "temp-accent";
+        let kpiTempColorClass = "temp-accent";
+        if (isHotDanger) {
+          tempColorClass = "temp-hot";
+          kpiTempColorClass = "kpi-temp-hot";
+        } else if (isColdDanger) {
+          tempColorClass = "temp-cold";
+          kpiTempColorClass = "kpi-temp-cold";
+        } else if (badgeClass === "badge-warn") {
+          tempColorClass = "temp-warn";
+          kpiTempColorClass = "kpi-temp-warn";
+        }
+        el("tempValue").className = "temp-value " + tempColorClass;
+
+        el("kpiTemp").textContent = fmtTemp(latest.temperature);
+        el("kpiTemp").className = "value " + kpiTempColorClass;
+        el("kpiStatus").textContent = badgeText;
+        let stc = "status-ok";
+        if (badgeClass === "badge-warn") stc = "status-warn";
+        if (badgeClass === "badge-danger") stc = "status-danger";
+        el("kpiStatus").className = "value " + stc;
+      }
+
+      function applyFixedTimeWindow() {
+        const now = Date.now();
+        const step = X_TICK_STEP_MS;
+        const xMax = Math.ceil(now / step) * step;
+        const xMin = xMax - CHART_WINDOW_MS;
+        chart.options.scales.x.min = xMin;
+        chart.options.scales.x.max = xMax;
+        setRefLines(xMin, xMax);
+        return { xMin, xMax };
+      }
+
+      /**
+       * X축 오른쪽 끝 = 마지막 샘플 + CHART_RIGHT_PAD_MS (예: 10초).
+       * “지금 시각”이나 분 단위 올림으로 축만 길어지는 우측 빈 구간을 없앰.
+       * 왼쪽 = 최소 CHART_WINDOW_MS 구간을 유지하되, 데이터가 더 길면 가장 오래된 점까지 포함.
+       */
+      function fitXAxisToData(pts) {
+        if (!pts.length) {
+          applyFixedTimeWindow();
+          return;
+        }
+        const xs = pts.map((p) => p.x);
+        const dMin = Math.min(...xs);
+        const dMax = Math.max(...xs);
+
+        const xMax = dMax + CHART_RIGHT_PAD_MS;
+        let xMin = Math.min(dMin - CHART_LEFT_PAD_MS, xMax - CHART_WINDOW_MS);
+
+        const minSpan = 15000;
+        if (xMax - xMin < minSpan) {
+          xMin = xMax - minSpan;
+        }
+
+        chart.options.scales.x.min = xMin;
+        chart.options.scales.x.max = xMax;
+        setRefLines(xMin, xMax);
+      }
+
+      async function refreshSeries() {
+        const series = await fetchJson("/api/temperature-series");
+        state.series = Array.isArray(series) ? series : [];
+        const pts = state.series
+          .filter((p) => p && p.x != null && p.y != null)
+          .map((p) => ({ x: Number(p.x) * 1000, y: Number(p.y) }));
+        chart.data.datasets[0].data = pts;
+        if (pts.length === 0) {
+          applyFixedTimeWindow();
+          chart.options.scales.y.min = -1;
+          chart.options.scales.y.max = 11;
+        } else {
+          fitXAxisToData(pts);
+          const { min, max } = computeYRange(pts);
+          chart.options.scales.y.min = min;
+          chart.options.scales.y.max = max;
+        }
+        chart.update("none");
+        el("kpiCount").textContent = String(pts.length);
+      }
+
+      async function refreshHealth() {
+        const [internet, temp] = await Promise.all([
+          fetchJson("/api/health/internet").catch(() => ({ connected: false })),
+          fetchJson("/api/health/temperature").catch(() => ({ connected: false }))
+        ]);
+
+        const wrap = el("connWrap");
+        el("internetText").textContent = internet.connected ? "연결됨" : "연결안됨";
+        wrap.style.color = internet.connected ? "var(--ok)" : "var(--danger)";
+
+        el("kpiSensor").textContent = temp.connected ? "연결됨" : "미연결";
+        el("kpiSensor").className = "value " + (temp.connected ? "sensor-ok" : "sensor-bad");
+      }
+
+      async function refreshReverseGeocode() {
+        const lat = state.latest?.latitude;
+        const lon = state.latest?.longitude;
+        if (lat == null || lon == null) {
+          el("locationText").textContent = "현재 위치: -";
+          return;
+        }
+        try {
+          const q = `/api/reverse-geocode?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+          const data = await fetchJson(q);
+          el("locationText").textContent = `현재 위치: ${data.display || `${fmtNum(lat, 6)}, ${fmtNum(lon, 6)}`}`;
+        } catch {
+          el("locationText").textContent = `현재 위치: ${fmtNum(lat, 6)}, ${fmtNum(lon, 6)}`;
+        }
+      }
+
+      async function refreshAll() {
+        el("nowTime").textContent = new Date().toLocaleString("ko-KR", {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: true
+        });
+        try {
+          await refreshLatest();
+          await Promise.all([refreshSeries(), refreshHealth()]);
+          await refreshReverseGeocode();
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      refreshAll();
+      setInterval(refreshAll, 5000);
+    </script>
+  </body>
+</html>

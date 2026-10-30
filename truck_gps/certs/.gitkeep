@@ -1,0 +1,11 @@
+# provision_iot_cert.py 가 PEM 파일을 생성합니다 (Git 제외)
+#
+# 방법 A) API 자동:  python3 provision_iot_cert.py  (config.py DEVICE_ID, DEVICE_MAC)
+# 방법 B) JSON 붙여넣기:
+#   cp iot_credentials.json.example iot_credentials.json
+#   nano iot_credentials.json
+#   python3 save_iot_certs.py
+# 방법 C) PEM 직접:
+#   cp device-cert.pem.example device-cert.pem
+#   cp private-key.pem.example private-key.pem
+#   nano 로 붙여넣기 후 chmod 600 private-key.pem

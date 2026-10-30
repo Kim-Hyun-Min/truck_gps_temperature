@@ -31,6 +31,14 @@ wheels/
 venv/
 env/
 ENV/
+gps_env/
+
+# 로컬 전용 설정 (비밀번호·내부 IP — config.example.py 를 복사해 사용)
+config.py
+
+# AWS IoT 인증서 (Pi별로 provision_iot_cert.py / save_iot_certs.py 로 생성)
+certs/*.pem
+certs/iot_credentials.json
 
 # IDE
 .vscode/
